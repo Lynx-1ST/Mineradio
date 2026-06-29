@@ -2,7 +2,7 @@
   "name": "mineradio",
   "productName": "Mineradio",
   "version": "1.1.1",
-  "description": "沉浸式音乐播放器，融合天气电台、歌词舞台、粒子视觉和 3D 歌单架。",
+  "description": "Immersive music player with weather radio, lyric stage, particle visuals, Spotify search, and a 3D playlist shelf.",
   "author": "Mineradio",
   "main": "desktop/main.js",
   "private": true,
@@ -89,7 +89,7 @@
     "NeteaseCloudMusicApi": "^4.32.0"
   },
   "devDependencies": {
-    "electron": "^42.4.1",
+    "electron": "https://github.com/castlabs/electron-releases#v42.3.3+wvcus",
     "electron-builder": "^26.15.3",
     "rcedit": "^5.0.2"
   }

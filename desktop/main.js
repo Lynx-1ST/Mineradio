@@ -1,8 +1,35 @@
-const { app, BrowserWindow, ipcMain, shell, screen, session, globalShortcut, dialog } = require('electron');
+const { app, BrowserWindow, ipcMain, shell, screen, session, globalShortcut, dialog, components, desktopCapturer } = require('electron');
 const net = require('net');
 const path = require('path');
 const fs = require('fs');
 const { execFile, spawn } = require('child_process');
+
+// i18n for desktop main process
+const I18N_DIR = path.join(__dirname, '..', 'public', 'locales');
+const desktopTranslations = {};
+let desktopLang = 'zh-CN';
+function loadDesktopLang(lang) {
+  try {
+    const file = path.join(I18N_DIR, lang + '.json');
+    if (fs.existsSync(file)) {
+      desktopTranslations[lang] = JSON.parse(fs.readFileSync(file, 'utf8'));
+      desktopLang = lang;
+    }
+  } catch (e) {}
+}
+function dt(key, params) {
+  let dict = desktopTranslations[desktopLang] || {};
+  let val = dict[key];
+  if (val === undefined && desktopLang !== 'zh-CN') {
+    val = (desktopTranslations['zh-CN'] || {})[key];
+  }
+  if (val === undefined) val = key;
+  if (params) {
+    Object.keys(params).forEach(k => { val = val.replace(new RegExp('\\{' + k + '\\}', 'g'), params[k]); });
+  }
+  return val;
+}
+loadDesktopLang('zh-CN');
 
 let mainWindow = null;
 let localServer = null;
@@ -164,9 +191,9 @@ function configureMineradioGlobalHotkeys(bindings = []) {
         accelerator,
         ok: false,
         conflict: {
-          sourceName: '系统 / 其他软件',
+          sourceName: dt('desktop_hotkey_source'),
           sourceIcon: 'warning',
-          reason: '该组合键已被占用或被系统保留',
+          reason: dt('desktop_hotkey_conflict'),
         },
       });
     }
@@ -415,7 +442,7 @@ async function openNeteaseMusicLoginWindow(owner) {
       modal: false,
       show: false,
       autoHideMenuBar: true,
-      title: '网易云音乐登录',
+      title: dt('desktop_netease_login'),
       backgroundColor: '#111111',
       icon: APP_ICON_ICO,
       webPreferences: {
@@ -487,9 +514,9 @@ async function openNeteaseMusicLoginWindow(owner) {
         const cookie = await readNeteaseLoginCookieHeader(cookieSession);
         resolve(neteaseCookieHasLogin(cookie)
           ? { ok: true, cookie, partial: !qqCookieHasPlaybackLogin(cookie) }
-          : { ok: false, cancelled: true, message: '网易云登录窗口已关闭' });
+          : { ok: false, cancelled: true, message: dt('desktop_netease_closed') });
       } catch (e) {
-        resolve({ ok: false, error: e.message || '网易云登录窗口已关闭' });
+        resolve({ ok: false, error: e.message || dt('desktop_netease_closed') });
       }
     });
 
@@ -517,7 +544,7 @@ async function openQQMusicLoginWindow(owner) {
       modal: false,
       show: false,
       autoHideMenuBar: true,
-      title: 'QQ 音乐登录',
+      title: dt('desktop_qq_login'),
       backgroundColor: '#111111',
       icon: APP_ICON_ICO,
       webPreferences: {
@@ -589,9 +616,9 @@ async function openQQMusicLoginWindow(owner) {
         const cookie = await readQQLoginCookieHeader(cookieSession);
         resolve(qqCookieHasLogin(cookie)
           ? { ok: true, cookie }
-          : { ok: false, cancelled: true, message: 'QQ 登录窗口已关闭' });
+          : { ok: false, cancelled: true, message: dt('desktop_qq_closed') });
       } catch (e) {
-        resolve({ ok: false, error: e.message || 'QQ 登录窗口已关闭' });
+        resolve({ ok: false, error: e.message || dt('desktop_qq_closed') });
       }
     });
 
@@ -1117,6 +1144,18 @@ ipcMain.handle('desktop-window-get-state', (event) => {
   return getWindowState(getSenderWindow(event));
 });
 
+ipcMain.handle('mineradio-widevine-status', async () => {
+  try {
+    if (!components || typeof components.status !== 'function') {
+      return { ok: false, available: false, error: 'Electron components API is unavailable' };
+    }
+    if (typeof components.whenReady === 'function') await components.whenReady();
+    return { ok: true, available: true, status: components.status ? components.status() : null };
+  } catch (e) {
+    return { ok: false, available: false, error: e && e.message ? e.message : String(e) };
+  }
+});
+
 ipcMain.handle('desktop-window-close', (event) => {
   getSenderWindow(event)?.close();
 });
@@ -1130,7 +1169,7 @@ ipcMain.handle('mineradio-export-json-file', async (event, payload = {}) => {
     const owner = getSenderWindow(event);
     const defaultName = String(payload.defaultName || 'mineradio-export.json').replace(/[\\/:*?"<>|]+/g, '-');
     const result = await dialog.showSaveDialog(owner, {
-      title: '导出 Mineradio 存档',
+      title: dt('desktop_export_title'),
       defaultPath: defaultName.toLowerCase().endsWith('.json') ? defaultName : `${defaultName}.json`,
       filters: [{ name: 'JSON', extensions: ['json'] }],
     });
@@ -1147,7 +1186,7 @@ ipcMain.handle('mineradio-import-json-file', async (event) => {
   try {
     const owner = getSenderWindow(event);
     const result = await dialog.showOpenDialog(owner, {
-      title: '导入 Mineradio 存档',
+      title: dt('desktop_import_title'),
       properties: ['openFile'],
       filters: [{ name: 'JSON', extensions: ['json'] }],
     });
@@ -1376,6 +1415,13 @@ async function createWindow() {
     sendWindowState(mainWindow);
   });
 
+  mainWindow.webContents.on('console-message', (_event, level, message, line, sourceId) => {
+    const text = String(message || '');
+    if (!/\[Spotify|\[Widevine|SpotifyDRM|playback_error|DRM|Widevine/i.test(text)) return;
+    const where = sourceId ? ` ${path.basename(sourceId)}:${line || 0}` : '';
+    console.log(`[Renderer:${level}]${where} ${text}`);
+  });
+
   mainWindow.webContents.on('before-input-event', (event, input) => {
     if (input.type === 'keyDown' && (input.key === 'Escape' || input.code === 'Escape') && mainWindow.isFullScreen()) {
       event.preventDefault();
@@ -1439,6 +1485,14 @@ if (!gotSingleInstanceLock) {
   });
 
   app.whenReady().then(async () => {
+    try {
+      if (components && typeof components.whenReady === 'function') {
+        await components.whenReady();
+        console.log('[Widevine] components ready:', JSON.stringify(components.status ? components.status() : {}));
+      }
+    } catch (e) {
+      console.error('[Widevine] components init failed:', e && e.message);
+    }
     screen.on('display-metrics-changed', () => {
       positionDesktopLyricsWindow();
       positionWallpaperWindow();

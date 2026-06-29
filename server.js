@@ -54,6 +54,56 @@ const { once } = require('events');
 const { fileURLToPath } = require('url');
 const { analyzePodcastDjStream, analyzePodcastDjIntro } = require('./dj-analyzer');
 
+function loadLocalEnvFile() {
+  const envFile = path.join(__dirname, '.env');
+  try {
+    if (!fs.existsSync(envFile)) return;
+    const lines = fs.readFileSync(envFile, 'utf8').split(/\r?\n/);
+    lines.forEach(line => {
+      const raw = String(line || '').trim();
+      if (!raw || raw.startsWith('#')) return;
+      const idx = raw.indexOf('=');
+      if (idx <= 0) return;
+      const key = raw.slice(0, idx).trim();
+      let val = raw.slice(idx + 1).trim();
+      if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+        val = val.slice(1, -1);
+      }
+      if (key && process.env[key] === undefined) process.env[key] = val;
+    });
+  } catch (e) {
+    console.warn('[LocalEnv] failed to load .env:', e.message);
+  }
+}
+loadLocalEnvFile();
+
+// i18n for server-side strings
+const I18N_DIR = path.join(__dirname, 'public', 'locales');
+const serverTranslations = {};
+let serverLang = 'en';
+function loadServerLang(lang) {
+  try {
+    const file = path.join(I18N_DIR, lang + '.json');
+    if (fs.existsSync(file)) {
+      serverTranslations[lang] = JSON.parse(fs.readFileSync(file, 'utf8'));
+      serverLang = lang;
+    }
+  } catch (e) {}
+}
+function st(key, params) {
+  let dict = serverTranslations[serverLang] || {};
+  let val = dict[key];
+  if (val === undefined && serverLang !== 'en') {
+    val = (serverTranslations.en || {})[key];
+  }
+  if (val === undefined) val = key;
+  if (params) {
+    Object.keys(params).forEach(k => { val = val.replace(new RegExp('\\{' + k + '\\}', 'g'), params[k]); });
+  }
+  return val;
+}
+loadServerLang('en');
+
 const PORT = process.env.PORT || 3000;
 const HOST = process.env.HOST || '0.0.0.0';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
@@ -77,6 +127,25 @@ const UPDATE_FALLBACK_NOTES = [
 const OPEN_METEO_FORECAST_URL = 'https://api.open-meteo.com/v1/forecast';
 const OPEN_METEO_GEOCODE_URL = 'https://geocoding-api.open-meteo.com/v1/search';
 const WEATHER_IP_LOCATION_URL = 'http://ip-api.com/json/';
+const SPOTIFY_TOKEN_URL = 'https://accounts.spotify.com/api/token';
+const SPOTIFY_SEARCH_URL = 'https://api.spotify.com/v1/search';
+const SPOTIFY_AUTH_URL = 'https://accounts.spotify.com/authorize';
+const SPOTIFY_ME_URL = 'https://api.spotify.com/v1/me';
+const SPOTIFY_API_URL = 'https://api.spotify.com/v1';
+const LRCLIB_API_URL = 'https://lrclib.net/api';
+const SPOTIFY_CLIENT_ID = process.env.SPOTIFY_CLIENT_ID || '';
+const SPOTIFY_CLIENT_SECRET = process.env.SPOTIFY_CLIENT_SECRET || '';
+const SPOTIFY_REDIRECT_URI = process.env.SPOTIFY_REDIRECT_URI || `http://127.0.0.1:${PORT}/api/spotify/callback`;
+const SPOTIFY_SESSION_FILE = process.env.SPOTIFY_SESSION_FILE || path.join(__dirname, '.spotify-session');
+const SPOTIFY_SCOPES = [
+  'user-read-email',
+  'user-read-private',
+  'streaming',
+  'user-read-playback-state',
+  'user-modify-playback-state',
+  'playlist-read-private',
+  'playlist-read-collaborative',
+];
 const WEATHER_DEFAULT_LOCATION = {
   name: '上海',
   country: 'China',
@@ -86,6 +155,9 @@ const WEATHER_DEFAULT_LOCATION = {
 };
 
 const updateDownloadJobs = new Map();
+const spotifyTokenCache = { token: '', expiresAt: 0 };
+let spotifyUserSession = readSpotifyUserSession();
+const spotifyOAuthStates = new Map();
 
 function applySystemCertificateAuthorities() {
   try {
@@ -309,7 +381,7 @@ function uniqueDownloadCandidates(urls, opts) {
   });
   const direct = directUrls.map(url => ({
     url,
-    label: directSet.has(url.toLowerCase()) ? 'GitHub 直连' : '下载线路',
+    label: directSet.has(url.toLowerCase()) ? 'GitHub 直连' : st('server_download_source'),
     mirrored: false,
   }));
   const ordered = UPDATE_CONFIG.preferMirrors === false ? direct.concat(mirrored) : mirrored.concat(direct);
@@ -477,7 +549,7 @@ function normalizeManifestUpdateInfo(data) {
       asset: assetInfo,
       patch: patchInfo,
       patchAvailable: !!(patchInfo && patchInfo.downloadUrl && compareVersions(latestVersion, APP_VERSION) > 0),
-      summary: release.summary || data.summary || notes[0] || '发现新版本，建议更新。',
+      summary: release.summary || data.summary || notes[0] || st('server_update_available'),
       notes,
     },
     source: 'manifest',
@@ -584,7 +656,7 @@ function localUpdateFallback(reason, opts) {
       version: APP_VERSION,
       htmlUrl: '',
       downloadUrl: '',
-      summary: '当前版本，更新检测已就绪。',
+      summary: st('server_current_ready'),
       notes: UPDATE_FALLBACK_NOTES,
     },
     reason: reason || '',
@@ -599,31 +671,31 @@ function updateError(code, message, cause) {
 function classifyUpdateError(err) {
   const code = String(err && err.code || '').trim();
   const message = String(err && err.message || err || '').trim();
-  const detail = message || code || '未知错误';
+  const detail = message || code || st('server_unknown_error');
   if (/HASH|DIGEST|CHECKSUM/i.test(code + ' ' + message)) {
-    return { code: code || 'UPDATE_HASH_MISMATCH', reason: '文件校验失败，可能是线路缓存异常，已拦截该安装包。', detail };
+    return { code: code || 'UPDATE_HASH_MISMATCH', reason: st('server_hash_fail'), detail };
   }
   if (/SIZE_MISMATCH|content length/i.test(code + ' ' + message)) {
-    return { code: code || 'UPDATE_SIZE_MISMATCH', reason: '下载文件大小不一致，可能是网络中断或线路缓存不完整。', detail };
+    return { code: code || 'UPDATE_SIZE_MISMATCH', reason: st('server_size_mismatch'), detail };
   }
   if (/AbortError|TIMEOUT|ETIMEDOUT|timeout/i.test(code + ' ' + message)) {
-    return { code: code || 'UPDATE_TIMEOUT', reason: '连接超时，当前网络到更新线路不稳定。', detail };
+    return { code: code || 'UPDATE_TIMEOUT', reason: st('server_timeout'), detail };
   }
   if (/ENOTFOUND|EAI_AGAIN|DNS|fetch failed|getaddrinfo/i.test(code + ' ' + message)) {
-    return { code: code || 'UPDATE_DNS_FAILED', reason: '域名解析失败，可能是当前网络无法连接该更新线路。', detail };
+    return { code: code || 'UPDATE_DNS_FAILED', reason: st('server_dns_fail'), detail };
   }
   if (/ECONNRESET|ECONNREFUSED|socket|network/i.test(code + ' ' + message)) {
-    return { code: code || 'UPDATE_NETWORK_FAILED', reason: '网络连接被中断，已尝试切换更新线路。', detail };
+    return { code: code || 'UPDATE_NETWORK_FAILED', reason: st('server_network_interrupted'), detail };
   }
   const http = message.match(/\bHTTP[_\s-]?(\d{3})\b/i) || message.match(/\b(\d{3})\b/);
   if (http) {
     const status = Number(http[1]);
-    if (status === 403) return { code: code || 'UPDATE_HTTP_403', reason: '更新线路返回 403，可能被限流或拦截。', detail };
-    if (status === 404) return { code: code || 'UPDATE_HTTP_404', reason: '更新文件不存在，可能 release 资源还没有同步完成。', detail };
-    if (status >= 500) return { code: code || 'UPDATE_HTTP_5XX', reason: '更新线路服务器异常，请稍后重试。', detail };
-    return { code: code || ('UPDATE_HTTP_' + status), reason: '更新线路返回 HTTP ' + status + '。', detail };
+    if (status === 403) return { code: code || 'UPDATE_HTTP_403', reason: st('server_http_403'), detail };
+    if (status === 404) return { code: code || 'UPDATE_HTTP_404', reason: st('server_http_404'), detail };
+    if (status >= 500) return { code: code || 'UPDATE_HTTP_5XX', reason: st('server_http_5xx'), detail };
+    return { code: code || ('UPDATE_HTTP_' + status), reason: st('server_http_error', { status: status }), detail };
   }
-  return { code: code || 'UPDATE_FAILED', reason: '更新失败：' + detail, detail };
+  return { code: code || 'UPDATE_FAILED', reason: st('server_update_failed', { detail: detail }), detail };
 }
 async function fetchWithTimeout(url, opts, timeoutMs) {
   const controller = new AbortController();
@@ -698,8 +770,8 @@ function parseLatestYmlUpdateInfo(text, reason) {
       asset,
       patch: null,
       patchAvailable: false,
-      summary: '发现新版本，已启用备用更新线路。',
-      notes: ['更新检测已切换到备用线路', '下载时会自动选择国内加速线路', '下载失败会显示具体原因和当前速度'],
+      summary: st('server_update_fallback'),
+      notes: [st('server_update_fallback_notes'), st('server_download_fallback_notes'), st('server_download_fail_notes')],
     },
     source: 'latest-yml',
     reason: reason || '',
@@ -751,7 +823,7 @@ async function fetchLatestUpdateInfo() {
         asset,
         patch,
         patchAvailable: !!(patch && patch.downloadUrl && compareVersions(latestVersion, APP_VERSION) > 0),
-        summary: notes[0] || '发现新版本，建议更新。',
+        summary: notes[0] || st('server_update_available'),
         notes,
       },
     };
@@ -830,7 +902,7 @@ async function downloadUpdateAsset(job) {
     job.progress = 0;
     job.speedBps = 0;
     job.etaSeconds = 0;
-    job.message = job.total ? '正在下载完整安装包' : '正在下载完整安装包，等待服务器返回大小';
+    job.message = job.total ? st('server_downloading_full') : st('server_downloading_full') + '，等待服务器返回大小';
     job.updatedAt = Date.now();
     let speedWindowAt = Date.now();
     let speedWindowBytes = 0;
@@ -857,7 +929,7 @@ async function downloadUpdateAsset(job) {
           const kb = Math.max(1, job.received / 1024);
           job.progress = Math.max(1, Math.min(88, Math.round(Math.log10(kb + 1) * 24)));
         }
-        job.message = job.total > 0 ? '正在下载完整安装包' : '正在下载完整安装包，服务器未提供总大小';
+        job.message = job.total > 0 ? st('server_downloading_full') : st('server_downloading_full') + '，服务器未提供总大小';
         job.updatedAt = Date.now();
         if (!writer.write(buf)) await once(writer, 'drain');
       }
@@ -870,7 +942,7 @@ async function downloadUpdateAsset(job) {
     fs.renameSync(tmpPath, job.filePath);
     job.status = 'ready';
     job.progress = 100;
-    job.message = '安装包已下载';
+    job.message = st('server_download_done');
     job.updatedAt = Date.now();
   } catch (e) {
     try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (_) {}
@@ -932,11 +1004,11 @@ function reuseVerifiedInstallerJob(opts) {
     total: opts.expectedSize || stat.size || 0,
     speedBps: 0,
     etaSeconds: 0,
-    sourceLabel: '本地缓存',
+    sourceLabel: st('server_local_cache'),
     attempt: 0,
     attempts: opts.attempts || 0,
     mode: 'installer',
-    message: '安装包已下载，可直接打开安装',
+    message: st('server_download_done_install'),
     fileName: opts.fileName || path.basename(opts.filePath),
     filePath: opts.filePath,
     version: opts.version || '',
@@ -973,7 +1045,7 @@ function setUpdateJobError(job, err, fallbackMessage) {
 }
 function prepareUpdateJobAttempt(job, candidate, index, total) {
   job.status = 'downloading';
-  job.sourceLabel = candidate.label || '下载线路';
+  job.sourceLabel = candidate.label || st('server_download_source');
   job.attempt = index + 1;
   job.attempts = total;
   job.received = 0;
@@ -1002,7 +1074,7 @@ async function downloadUpdateAssetWithMirrors(job) {
       try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (_) {}
       ensureMirrorCanBeVerified(job, candidate);
       prepareUpdateJobAttempt(job, candidate, i, candidates.length);
-      job.message = job.total ? '正在下载完整安装包' : '正在下载完整安装包，等待服务器返回大小';
+      job.message = job.total ? st('server_downloading_full') : st('server_downloading_full') + '，等待服务器返回大小';
 
       const resp = await fetchWithTimeout(candidate.url, {
         headers: { 'User-Agent': `Mineradio/${APP_VERSION}` },
@@ -1038,7 +1110,7 @@ async function downloadUpdateAssetWithMirrors(job) {
             const kb = Math.max(1, job.received / 1024);
             job.progress = Math.max(1, Math.min(88, Math.round(Math.log10(kb + 1) * 24)));
           }
-          job.message = job.total > 0 ? '正在下载完整安装包' : '正在下载完整安装包，服务器未提供总大小';
+          job.message = job.total > 0 ? st('server_downloading_full') : st('server_downloading_full') + '，服务器未提供总大小';
           job.updatedAt = Date.now();
           if (!writer.write(buf)) await once(writer, 'drain');
         }
@@ -1053,17 +1125,17 @@ async function downloadUpdateAssetWithMirrors(job) {
       job.status = 'ready';
       job.progress = 100;
       job.etaSeconds = 0;
-      job.message = '安装包已下载';
+      job.message = st('server_download_done');
       job.updatedAt = Date.now();
       return;
     } catch (err) {
       try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (_) {}
       const info = classifyUpdateError(err);
-      failures.push({ source: candidate.label || '下载线路', reason: info.reason, detail: info.detail });
+      failures.push({ source: candidate.label || st('server_download_source'), reason: info.reason, detail: info.detail });
       job.failedAttempts = failures.slice(-6);
-      job.message = i < candidates.length - 1 ? ((candidate.label || '当前线路') + '失败，正在切换线路') : info.reason;
+      job.message = i < candidates.length - 1 ? ((candidate.label || st('server_current_source')) + st('server_source_switching')) : info.reason;
       job.updatedAt = Date.now();
-      if (i >= candidates.length - 1) setUpdateJobError(job, err, '下载失败：' + info.reason);
+      if (i >= candidates.length - 1) setUpdateJobError(job, err, st('server_download_fail') + info.reason);
     }
   }
 }
@@ -1199,7 +1271,7 @@ async function downloadAndApplyPatch(job) {
     fs.mkdirSync(UPDATE_DOWNLOAD_DIR, { recursive: true });
     job.status = 'downloading';
     job.mode = 'patch';
-    job.message = '正在下载快速补丁';
+    job.message = st('server_downloading_patch');
     job.updatedAt = Date.now();
 
     const resp = await fetch(job.downloadUrl, {
@@ -1228,7 +1300,7 @@ async function downloadAndApplyPatch(job) {
     if (expectedPatchHash && sha256Hex(raw) !== expectedPatchHash) throw new Error('PATCH_PACKAGE_HASH_MISMATCH');
     const patch = normalizePatchPayload(JSON.parse(raw.toString('utf8').replace(/^\uFEFF/, '')));
     job.version = patch.to;
-    job.message = '正在应用快速补丁';
+    job.message = st('server_applying_patch');
     job.progress = 88;
     job.updatedAt = Date.now();
     const changed = [];
@@ -1237,12 +1309,12 @@ async function downloadAndApplyPatch(job) {
     job.status = 'ready';
     job.progress = 100;
     job.restartRequired = patch.restartRequired;
-    job.message = patch.restartRequired ? '快速补丁已应用，重启后生效' : '快速补丁已应用';
+    job.message = patch.restartRequired ? st('server_patch_applied') : st('server_patch_applied_short');
     job.updatedAt = Date.now();
   } catch (e) {
     job.status = 'error';
     job.error = e.message || 'PATCH_APPLY_FAILED';
-    job.message = '快速补丁失败，可改用完整安装包';
+    job.message = st('server_patch_fallback');
     job.updatedAt = Date.now();
   }
 }
@@ -1250,7 +1322,7 @@ async function downloadPatchBufferFromCandidate(job, candidate, index, total) {
   ensureMirrorCanBeVerified(job, candidate);
   prepareUpdateJobAttempt(job, candidate, index, total);
   job.mode = 'patch';
-  job.message = '正在下载快速补丁';
+  job.message = st('server_downloading_patch');
   job.progress = 0;
   job.updatedAt = Date.now();
 
@@ -1301,7 +1373,7 @@ async function downloadAndApplyPatchWithMirrors(job) {
       const raw = await downloadPatchBufferFromCandidate(job, candidate, i, candidates.length);
       const patch = normalizePatchPayload(JSON.parse(raw.toString('utf8').replace(/^\uFEFF/, '')));
       job.version = patch.to;
-      job.message = '正在应用快速补丁';
+      job.message = st('server_applying_patch');
       job.progress = 88;
       job.etaSeconds = 0;
       job.updatedAt = Date.now();
@@ -1311,16 +1383,16 @@ async function downloadAndApplyPatchWithMirrors(job) {
       job.status = 'ready';
       job.progress = 100;
       job.restartRequired = patch.restartRequired;
-      job.message = patch.restartRequired ? '快速补丁已应用，重启后生效' : '快速补丁已应用';
+      job.message = patch.restartRequired ? st('server_patch_applied') : st('server_patch_applied_short');
       job.updatedAt = Date.now();
       return;
     } catch (err) {
       const info = classifyUpdateError(err);
-      failures.push({ source: candidate.label || '下载线路', reason: info.reason, detail: info.detail });
+      failures.push({ source: candidate.label || st('server_download_source'), reason: info.reason, detail: info.detail });
       job.failedAttempts = failures.slice(-6);
-      job.message = i < candidates.length - 1 ? ((candidate.label || '当前线路') + '失败，正在切换线路') : info.reason;
+      job.message = i < candidates.length - 1 ? ((candidate.label || st('server_current_source')) + st('server_source_switching')) : info.reason;
       job.updatedAt = Date.now();
-      if (i >= candidates.length - 1) setUpdateJobError(job, err, '快速补丁失败：' + info.reason);
+      if (i >= candidates.length - 1) setUpdateJobError(job, err, st('server_patch_fail') + info.reason);
     }
   }
 }
@@ -1361,7 +1433,7 @@ function startUpdatePatchJob(info) {
     attempt: 0,
     attempts: downloadCandidates.length,
     failedAttempts: [],
-    message: '等待下载快速补丁',
+    message: st('server_waiting_patch'),
     createdAt: now,
     updatedAt: now,
     error: '',
@@ -1493,21 +1565,21 @@ function classifyNeteasePlaybackRestriction(lastData, loginInfo) {
   const code = Number(lastData && lastData.code);
   const freeTrial = lastData && lastData.freeTrialInfo;
   if (!loggedIn) {
-    return playbackRestriction('netease', 'login_required', '网易云需要登录后尝试获取完整播放地址', 'login', { code, fee });
+    return playbackRestriction('netease', 'login_required', st('server_netease_need_login'), 'login', { code, fee });
   }
   if (freeTrial) {
-    return playbackRestriction('netease', 'trial_only', '网易云仅返回试听片段，完整播放需要会员或购买', 'upgrade', { code, fee });
+    return playbackRestriction('netease', 'trial_only', st('server_netease_trial_only'), 'upgrade', { code, fee });
   }
   if (fee === 1) {
-    return playbackRestriction('netease', 'vip_required', '网易云歌曲需要 VIP 权限，当前无法获取完整播放地址', 'upgrade', { code, fee });
+    return playbackRestriction('netease', 'vip_required', st('server_netease_vip_required'), 'upgrade', { code, fee });
   }
   if (fee === 4 || fee === 8) {
-    return playbackRestriction('netease', 'paid_required', '网易云歌曲需要单曲、专辑购买或更高权限', 'purchase', { code, fee });
+    return playbackRestriction('netease', 'paid_required', st('server_netease_paid_required'), 'purchase', { code, fee });
   }
   if (code === 404 || code === 403) {
-    return playbackRestriction('netease', 'copyright_unavailable', '网易云版权暂不可播，换源或稍后重试会更稳', 'switch_source', { code, fee });
+    return playbackRestriction('netease', 'copyright_unavailable', st('server_netease_copyright'), 'switch_source', { code, fee });
   }
-  return playbackRestriction('netease', 'url_unavailable', '网易云没有返回可播放地址，可能是版权、会员或地区限制', loggedIn ? 'switch_source' : 'login', { code, fee });
+  return playbackRestriction('netease', 'url_unavailable', st('server_netease_url_unavailable'), loggedIn ? 'switch_source' : 'login', { code, fee });
 }
 function classifyQQPlaybackRestriction(info, session) {
   const hasSession = typeof session === 'object' ? !!session.hasSession : !!session;
@@ -1516,32 +1588,32 @@ function classifyQQPlaybackRestriction(info, session) {
   const code = Number((info && (info.result || info.code || info.errtype)) || 0);
   const lower = rawMsg.toLowerCase();
   if (!hasSession) {
-    return playbackRestriction('qq', 'login_required', 'QQ 音乐需要登录或授权后才能获取播放地址', 'login', { code, rawMessage: rawMsg });
+    return playbackRestriction('qq', 'login_required', st('server_qq_need_login'), 'login', { code, rawMessage: rawMsg });
   }
   if (!hasPlaybackKey && code === 104003) {
-    return playbackRestriction('qq', 'login_required', 'QQ 音乐当前只拿到了网页登录状态，还缺少播放授权，请重新打开官方 QQ 音乐登录窗口完成授权', 'login', { code, rawMessage: rawMsg, missingPlaybackKey: true });
+    return playbackRestriction('qq', 'login_required', st('server_qq_need_auth'), 'login', { code, rawMessage: rawMsg, missingPlaybackKey: true });
   }
   if (code === 104003) {
-    return playbackRestriction('qq', 'copyright_unavailable', 'QQ 音乐没有给当前版本返回播放地址，通常是版权、会员或官方版本限制，可以换一个搜索结果或切到网易云源', 'switch_source', { code, rawMessage: rawMsg });
+    return playbackRestriction('qq', 'copyright_unavailable', st('server_qq_copyright'), 'switch_source', { code, rawMessage: rawMsg });
   }
   if (/vip|会员|付费|购买|数字专辑|专辑|pay/.test(lower + rawMsg)) {
-    return playbackRestriction('qq', 'paid_required', 'QQ 音乐歌曲需要会员、购买或数字专辑权限', 'upgrade', { code, rawMessage: rawMsg });
+    return playbackRestriction('qq', 'paid_required', st('server_qq_paid_required'), 'upgrade', { code, rawMessage: rawMsg });
   }
   if (code && code !== 0) {
-    return playbackRestriction('qq', 'copyright_unavailable', rawMsg || 'QQ 音乐版权暂不可播或仅官方客户端可播', 'switch_source', { code, rawMessage: rawMsg });
+    return playbackRestriction('qq', 'copyright_unavailable', rawMsg || st('server_qq_copyright_fallback'), 'switch_source', { code, rawMessage: rawMsg });
   }
-  return playbackRestriction('qq', 'url_unavailable', 'QQ 音乐没有返回播放地址，可能受版权、会员或官方客户端限制', 'switch_source', { code, rawMessage: rawMsg });
+  return playbackRestriction('qq', 'url_unavailable', st('server_qq_url_unavailable'), 'switch_source', { code, rawMessage: rawMsg });
 }
 const NETEASE_QUALITY_CANDIDATES = [
-  { level: 'jymaster', br: 1999000, label: '超清母带', svip: true },
-  { level: 'hires',    br: 1999000, label: '高清臻音' },
-  { level: 'lossless', br: 1411000, label: '无损' },
-  { level: 'exhigh',   br: 999000,  label: '极高' },
-  { level: 'standard', br: 128000,  label: '标准' },
+  { level: 'jymaster', br: 1999000, label: st('quality_jymaster'), svip: true },
+  { level: 'hires',    br: 1999000, label: st('quality_hires') },
+  { level: 'lossless', br: 1411000, label: st('quality_lossless') },
+  { level: 'exhigh',   br: 999000,  label: st('quality_exhigh') },
+  { level: 'standard', br: 128000,  label: st('quality_standard') },
 ];
 const QQ_QUALITY_CANDIDATE_TEMPLATES = [
   { prefix: 'RS01', ext: '.flac', level: 'hires', label: 'Hi-Res FLAC' },
-  { prefix: 'F000', ext: '.flac', level: 'lossless', label: '无损 FLAC' },
+  { prefix: 'F000', ext: '.flac', level: 'lossless', label: st('quality_lossless_flac') },
   { prefix: 'M800', ext: '.mp3', level: 'exhigh', label: '320k MP3' },
   { prefix: 'M500', ext: '.mp3', level: 'standard', label: '128k MP3' },
   { prefix: 'C400', ext: '.m4a', level: 'aac', label: 'AAC/M4A' },
@@ -1788,19 +1860,19 @@ function clampNumber(value, min, max, fallback) {
 
 function openMeteoWeatherLabel(code) {
   code = Number(code);
-  if (code === 0) return '晴';
-  if (code === 1 || code === 2) return '少云';
-  if (code === 3) return '阴';
-  if (code === 45 || code === 48) return '雾';
-  if (code === 51 || code === 53 || code === 55) return '毛毛雨';
-  if (code === 56 || code === 57) return '冻雨';
-  if (code === 61 || code === 63 || code === 65) return '雨';
-  if (code === 66 || code === 67) return '冻雨';
-  if (code === 71 || code === 73 || code === 75 || code === 77) return '雪';
-  if (code === 80 || code === 81 || code === 82) return '阵雨';
-  if (code === 85 || code === 86) return '阵雪';
-  if (code === 95 || code === 96 || code === 99) return '雷雨';
-  return '天气';
+  if (code === 0) return st('weather_sunny');
+  if (code === 1 || code === 2) return st('weather_partly_cloudy');
+  if (code === 3) return st('weather_cloudy');
+  if (code === 45 || code === 48) return st('weather_fog');
+  if (code === 51 || code === 53 || code === 55) return st('weather_drizzle');
+  if (code === 56 || code === 57) return st('weather_freezing_rain');
+  if (code === 61 || code === 63 || code === 65) return st('weather_rain');
+  if (code === 66 || code === 67) return st('weather_freezing_rain');
+  if (code === 71 || code === 73 || code === 75 || code === 77) return st('weather_snow');
+  if (code === 80 || code === 81 || code === 82) return st('weather_shower');
+  if (code === 85 || code === 86) return st('weather_snow_shower');
+  if (code === 95 || code === 96 || code === 99) return st('weather_thunderstorm');
+  return st('weather_default');
 }
 
 function buildWeatherMood(weather, date) {
@@ -1823,8 +1895,8 @@ function buildWeatherMood(weather, date) {
 
   let mood = {
     key: 'clear',
-    title: '晴朗电台',
-    tagline: '让节奏亮一点，像窗边的光',
+    title: st('radio_clear_title'),
+    tagline: st('radio_clear_tagline'),
     energy: 0.62,
     warmth: 0.58,
     focus: 0.48,
@@ -1834,8 +1906,8 @@ function buildWeatherMood(weather, date) {
   if (isStorm) {
     mood = {
       key: 'storm',
-      title: '雷雨电台',
-      tagline: '低频更厚，适合把世界关小一点',
+      title: st('radio_storm_title'),
+      tagline: st('radio_storm_tagline'),
       energy: 0.46,
       warmth: 0.34,
       focus: 0.66,
@@ -1845,8 +1917,8 @@ function buildWeatherMood(weather, date) {
   } else if (isRain) {
     mood = {
       key: 'rain',
-      title: '雨天电台',
-      tagline: '留一点潮湿的空间给旋律',
+      title: st('radio_rain_title'),
+      tagline: st('radio_rain_tagline'),
       energy: 0.38,
       warmth: 0.42,
       focus: 0.64,
@@ -1856,8 +1928,8 @@ function buildWeatherMood(weather, date) {
   } else if (isSnow || feels <= 3) {
     mood = {
       key: 'snow',
-      title: '冷空气电台',
-      tagline: '干净、慢速、带一点冬天的颗粒感',
+      title: st('radio_snow_title'),
+      tagline: st('radio_snow_tagline'),
       energy: 0.34,
       warmth: 0.28,
       focus: 0.72,
@@ -1867,8 +1939,8 @@ function buildWeatherMood(weather, date) {
   } else if (feels >= 31 || humidity >= 78) {
     mood = {
       key: 'humid',
-      title: '闷热电台',
-      tagline: '降低密度，留出一点呼吸',
+      title: st('radio_humid_title'),
+      tagline: st('radio_humid_tagline'),
       energy: 0.48,
       warmth: 0.76,
       focus: 0.46,
@@ -1878,8 +1950,8 @@ function buildWeatherMood(weather, date) {
   } else if (isCloud) {
     mood = {
       key: 'cloudy',
-      title: '阴天电台',
-      tagline: '不急着明亮，先让声音变软',
+      title: st('radio_cloudy_title'),
+      tagline: st('radio_cloudy_tagline'),
       energy: 0.40,
       warmth: 0.46,
       focus: 0.58,
@@ -1890,18 +1962,18 @@ function buildWeatherMood(weather, date) {
 
   if (isNight) {
     mood.key += '-night';
-    mood.title = mood.key.startsWith('clear') ? '夜色电台' : mood.title.replace('电台', '夜听');
-    mood.tagline = '音量放低一点，让夜色参与编曲';
+    mood.title = mood.key.startsWith('clear') ? st('radio_night_title') : mood.title.replace('电台', '夜听');
+    mood.tagline = st('radio_night_tagline');
     mood.energy = Math.min(mood.energy, 0.42);
     mood.focus = Math.max(mood.focus, 0.68);
     mood.melancholy = Math.max(mood.melancholy, 0.52);
     mood.keywords = ['夜晚 R&B', 'late night jazz', 'ambient', 'lofi sleep', '夜跑 歌单'].concat(mood.keywords.slice(0, 3));
   } else if (isMorning) {
-    mood.title = mood.key.startsWith('rain') ? '雨晨电台' : '早晨电台';
+    mood.title = mood.key.startsWith('rain') ? st('radio_morning_rain_title') : st('radio_morning_title');
     mood.energy = Math.max(mood.energy, 0.52);
     mood.keywords = ['早晨 通勤', 'morning acoustic', '清晨 indie', '轻快 华语'].concat(mood.keywords.slice(0, 3));
   } else if (isDusk) {
-    mood.title = mood.key.startsWith('rain') ? '黄昏雨声' : '黄昏电台';
+    mood.title = mood.key.startsWith('rain') ? st('radio_dusk_rain_title') : st('radio_dusk_title');
     mood.melancholy = Math.max(mood.melancholy, 0.48);
     mood.keywords = ['黄昏 city pop', '日落 歌单', '落日飞车', 'soul pop'].concat(mood.keywords.slice(0, 3));
   }
@@ -2033,7 +2105,7 @@ function fallbackWeatherForRadio(params, err) {
       timezone: params.timezone || WEATHER_DEFAULT_LOCATION.timezone,
       fallback: true,
     },
-    label: '天气暂不可用',
+    label: st('weather_unavailable'),
     weatherCode: null,
     temperature: null,
     apparentTemperature: null,
@@ -2048,8 +2120,8 @@ function fallbackWeatherForRadio(params, err) {
     error: err && err.message || '',
     mood: {
       key: 'fallback',
-      title: '临时电台',
-      tagline: '天气暂时没有回来，先放一组稳妥的歌',
+      title: st('radio_temp_title'),
+      tagline: st('radio_temp_tagline'),
       energy: 0.54,
       warmth: 0.55,
       focus: 0.55,
@@ -2211,12 +2283,12 @@ async function buildWeatherRadio(params) {
   }
   const queries = weatherRadioSeedQueries(weather.mood);
   let songs = [];
-  const settled = await Promise.allSettled(queries.slice(0, 4).map(q => handleSearch(q, 6)));
+  const settled = await Promise.allSettled(queries.slice(0, 4).map(q => handleSpotifySearch(q, 6)));
   settled.forEach(result => {
     if (result.status === 'fulfilled' && Array.isArray(result.value)) songs = songs.concat(result.value);
   });
   if (songs.length < 10 && weather.mood && Array.isArray(weather.mood.keywords)) {
-    const more = await Promise.allSettled(weather.mood.keywords.slice(0, 2).map(q => handleSearch(q, 6)));
+    const more = await Promise.allSettled(weather.mood.keywords.slice(0, 2).map(q => handleSpotifySearch(q, 6)));
     more.forEach(result => {
       if (result.status === 'fulfilled' && Array.isArray(result.value)) songs = songs.concat(result.value);
     });
@@ -2239,6 +2311,283 @@ function parseJSONText(text) {
   const raw = String(text || '').trim();
   const json = raw.replace(/^callback\(([\s\S]*)\);?$/, '$1');
   return JSON.parse(json);
+}
+
+async function getSpotifyAccessToken() {
+  if (!SPOTIFY_CLIENT_ID || !SPOTIFY_CLIENT_SECRET) {
+    const err = new Error('Spotify credentials are not configured');
+    err.code = 'SPOTIFY_NOT_CONFIGURED';
+    throw err;
+  }
+  if (spotifyTokenCache.token && Date.now() < spotifyTokenCache.expiresAt - 30000) {
+    return spotifyTokenCache.token;
+  }
+  const auth = Buffer.from(SPOTIFY_CLIENT_ID + ':' + SPOTIFY_CLIENT_SECRET).toString('base64');
+  const text = await requestText(SPOTIFY_TOKEN_URL, {
+    method: 'POST',
+    headers: {
+      Authorization: 'Basic ' + auth,
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+  }, 'grant_type=client_credentials');
+  const data = JSON.parse(text);
+  if (!data || !data.access_token) throw new Error('Spotify token response missing access_token');
+  spotifyTokenCache.token = data.access_token;
+  spotifyTokenCache.expiresAt = Date.now() + Math.max(60, Number(data.expires_in) || 3600) * 1000;
+  return spotifyTokenCache.token;
+}
+
+function readSpotifyUserSession() {
+  try {
+    if (!fs.existsSync(SPOTIFY_SESSION_FILE)) return null;
+    const data = JSON.parse(fs.readFileSync(SPOTIFY_SESSION_FILE, 'utf8'));
+    return data && data.refresh_token ? data : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function saveSpotifyUserSession(session) {
+  spotifyUserSession = session || null;
+  try {
+    if (!session) {
+      if (fs.existsSync(SPOTIFY_SESSION_FILE)) fs.unlinkSync(SPOTIFY_SESSION_FILE);
+      return;
+    }
+    fs.writeFileSync(SPOTIFY_SESSION_FILE, JSON.stringify(session, null, 2));
+  } catch (e) {
+    console.warn('[SpotifySession] save failed:', e.message);
+  }
+}
+
+function spotifySessionPublic(session) {
+  session = session || spotifyUserSession;
+  const scopeText = String(session && session.scope || '');
+  const scopeSet = new Set(scopeText.split(/\s+/).filter(Boolean));
+  const missingScopes = SPOTIFY_SCOPES.filter(scope => !scopeSet.has(scope));
+  if (!session || !session.refresh_token) {
+    return { provider: 'spotify', configured: !!SPOTIFY_CLIENT_ID, loggedIn: false, scopes: SPOTIFY_SCOPES, missingScopes: SPOTIFY_SCOPES };
+  }
+  const profile = session.profile || {};
+  return {
+    provider: 'spotify',
+    configured: !!SPOTIFY_CLIENT_ID,
+    loggedIn: true,
+    userId: profile.id || '',
+    nickname: profile.display_name || profile.id || 'Spotify',
+    avatar: profile.images && profile.images[0] && profile.images[0].url || '',
+    product: profile.product || '',
+    expiresAt: session.expiresAt || 0,
+    scope: scopeText,
+    scopes: SPOTIFY_SCOPES,
+    missingScopes,
+    scopeUpgradeRequired: missingScopes.length > 0,
+  };
+}
+
+function spotifyTokenRequest(body) {
+  const auth = Buffer.from(SPOTIFY_CLIENT_ID + ':' + SPOTIFY_CLIENT_SECRET).toString('base64');
+  return requestText(SPOTIFY_TOKEN_URL, {
+    method: 'POST',
+    headers: {
+      Authorization: 'Basic ' + auth,
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+  }, body);
+}
+
+async function refreshSpotifyUserAccessToken() {
+  if (!spotifyUserSession || !spotifyUserSession.refresh_token) return '';
+  if (spotifyUserSession.access_token && Date.now() < (spotifyUserSession.expiresAt || 0) - 30000) {
+    return spotifyUserSession.access_token;
+  }
+  const text = await spotifyTokenRequest(new URLSearchParams({
+    grant_type: 'refresh_token',
+    refresh_token: spotifyUserSession.refresh_token,
+  }).toString());
+  const data = JSON.parse(text);
+  if (!data || !data.access_token) throw new Error('Spotify refresh response missing access_token');
+  saveSpotifyUserSession({
+    ...spotifyUserSession,
+    access_token: data.access_token,
+    refresh_token: data.refresh_token || spotifyUserSession.refresh_token,
+    scope: data.scope || spotifyUserSession.scope || '',
+    token_type: data.token_type || 'Bearer',
+    expiresAt: Date.now() + Math.max(60, Number(data.expires_in) || 3600) * 1000,
+  });
+  return spotifyUserSession.access_token;
+}
+
+async function getSpotifySearchToken() {
+  if (spotifyUserSession && spotifyUserSession.refresh_token) {
+    try {
+      const token = await refreshSpotifyUserAccessToken();
+      if (token) return token;
+    } catch (e) {
+      console.warn('[SpotifySession] refresh failed, falling back to client credentials:', e.message);
+    }
+  }
+  return getSpotifyAccessToken();
+}
+
+async function fetchSpotifyProfile(accessToken) {
+  const text = await requestText(SPOTIFY_ME_URL, {
+    headers: {
+      Authorization: 'Bearer ' + accessToken,
+      'User-Agent': UA,
+    },
+  });
+  return JSON.parse(text);
+}
+
+function spotifyLoginUrl() {
+  if (!SPOTIFY_CLIENT_ID || !SPOTIFY_CLIENT_SECRET) {
+    const err = new Error('Spotify credentials are not configured');
+    err.code = 'SPOTIFY_NOT_CONFIGURED';
+    throw err;
+  }
+  const state = crypto.randomBytes(16).toString('hex');
+  spotifyOAuthStates.set(state, Date.now() + 10 * 60 * 1000);
+  const u = new URL(SPOTIFY_AUTH_URL);
+  u.searchParams.set('client_id', SPOTIFY_CLIENT_ID);
+  u.searchParams.set('response_type', 'code');
+  u.searchParams.set('redirect_uri', SPOTIFY_REDIRECT_URI);
+  u.searchParams.set('state', state);
+  u.searchParams.set('scope', SPOTIFY_SCOPES.join(' '));
+  u.searchParams.set('show_dialog', 'true');
+  console.log('[SpotifyLogin] redirect_uri:', SPOTIFY_REDIRECT_URI);
+  return u.toString();
+}
+
+async function handleSpotifyCallback(code, state) {
+  const expiresAt = spotifyOAuthStates.get(state);
+  spotifyOAuthStates.delete(state);
+  if (!state || !expiresAt || Date.now() > expiresAt) throw new Error('Invalid or expired Spotify login state');
+  const text = await spotifyTokenRequest(new URLSearchParams({
+    grant_type: 'authorization_code',
+    code,
+    redirect_uri: SPOTIFY_REDIRECT_URI,
+  }).toString());
+  const data = JSON.parse(text);
+  if (!data || !data.access_token || !data.refresh_token) throw new Error('Spotify login response missing token');
+  const profile = await fetchSpotifyProfile(data.access_token);
+  saveSpotifyUserSession({
+    access_token: data.access_token,
+    refresh_token: data.refresh_token,
+    scope: data.scope || '',
+    token_type: data.token_type || 'Bearer',
+    expiresAt: Date.now() + Math.max(60, Number(data.expires_in) || 3600) * 1000,
+    profile,
+  });
+  return spotifySessionPublic();
+}
+
+function mapSpotifyTrack(track) {
+  track = track || {};
+  const album = track.album || {};
+  const artists = Array.isArray(track.artists) ? track.artists : [];
+  const images = Array.isArray(album.images) ? album.images : [];
+  const cover = images[0] && images[0].url || '';
+  return {
+    provider: 'spotify',
+    source: 'spotify',
+    type: 'spotify',
+    id: track.id || '',
+    uri: track.uri || '',
+    name: track.name || '',
+    artist: artists.map(a => a && a.name).filter(Boolean).join(' / '),
+    artists: artists.map(a => ({ id: a && a.id || '', name: a && a.name || '' })).filter(a => a.name),
+    album: album.name || '',
+    duration: track.duration_ms || 0,
+    cover,
+    picUrl: cover,
+    previewUrl: track.preview_url || '',
+    preview_url: track.preview_url || '',
+    externalUrl: track.external_urls && track.external_urls.spotify || '',
+    playable: !!track.preview_url,
+    fee: 0,
+  };
+}
+
+function mapSpotifyPlaylist(pl) {
+  pl = pl || {};
+  const images = Array.isArray(pl.images) ? pl.images : [];
+  return {
+    provider: 'spotify',
+    source: 'spotify',
+    id: pl.id || '',
+    uri: pl.uri || '',
+    name: pl.name || '',
+    cover: images[0] && images[0].url || '',
+    trackCount: pl.tracks && pl.tracks.total || 0,
+    creator: pl.owner && (pl.owner.display_name || pl.owner.id) || '',
+  };
+}
+
+async function spotifyApiGet(apiPath, params) {
+  const token = await refreshSpotifyUserAccessToken();
+  if (!token) {
+    const err = new Error('SPOTIFY_LOGIN_REQUIRED');
+    err.code = 'SPOTIFY_LOGIN_REQUIRED';
+    throw err;
+  }
+  const u = new URL(apiPath.startsWith('http') ? apiPath : SPOTIFY_API_URL + apiPath);
+  Object.entries(params || {}).forEach(([key, value]) => {
+    if (value != null && value !== '') u.searchParams.set(key, String(value));
+  });
+  const text = await requestText(u.toString(), {
+    headers: {
+      Authorization: 'Bearer ' + token,
+      'User-Agent': UA,
+    },
+  });
+  return JSON.parse(text);
+}
+
+async function handleSpotifySearch(keywords, limit) {
+  keywords = String(keywords || '').trim();
+  if (!keywords) return [];
+  const safeLimit = clampNumber(parseInt(limit, 10), 1, 50, 10);
+  const token = await getSpotifySearchToken();
+  const u = new URL(SPOTIFY_SEARCH_URL);
+  u.searchParams.set('q', keywords);
+  u.searchParams.set('type', 'track');
+  u.searchParams.set('limit', String(safeLimit));
+  u.searchParams.set('market', process.env.SPOTIFY_MARKET || 'US');
+  const opts = {
+    headers: {
+      Authorization: 'Bearer ' + token,
+      'User-Agent': UA,
+    },
+  };
+  let text;
+  try {
+    text = await requestText(u.toString(), opts);
+  } catch (err) {
+    if (err && err.statusCode === 400 && /Invalid limit/i.test(String(err.body || ''))) {
+      u.searchParams.set('limit', '10');
+      text = await requestText(u.toString(), opts);
+    } else {
+      throw err;
+    }
+  }
+  const data = JSON.parse(text);
+  const items = data && data.tracks && Array.isArray(data.tracks.items) ? data.tracks.items : [];
+  return items.map(mapSpotifyTrack).filter(song => song.id && song.name);
+}
+
+async function handleSpotifyUserPlaylists() {
+  const data = await spotifyApiGet('/me/playlists', { limit: 50 });
+  const playlists = data && Array.isArray(data.items) ? data.items : [];
+  return { provider: 'spotify', loggedIn: true, playlists: playlists.map(mapSpotifyPlaylist).filter(pl => pl.id) };
+}
+
+async function handleSpotifyPlaylistTracks(id) {
+  id = String(id || '').trim();
+  if (!id) return { provider: 'spotify', loggedIn: true, error: 'Missing Spotify playlist id', tracks: [] };
+  const data = await spotifyApiGet('/playlists/' + encodeURIComponent(id) + '/tracks', { limit: 100, market: process.env.SPOTIFY_MARKET || 'US' });
+  const items = data && Array.isArray(data.items) ? data.items : [];
+  return { provider: 'spotify', loggedIn: true, tracks: items.map(item => mapSpotifyTrack(item && item.track)).filter(song => song.id && song.name) };
 }
 
 async function qqMusicRequest(payload, opts) {
@@ -2817,6 +3166,400 @@ function normalizeQQSongId(id) {
   return n ? Number(n) : 0;
 }
 
+function normalizeLyricLookupText(text) {
+  return String(text || '').toLowerCase()
+    .replace(/\([^)]*\)|（[^）]*）|\[[^\]]*\]|【[^】]*】/g, '')
+    .replace(/\b(feat|ft|with|remaster|remastered|live|伴奏|纯音乐|翻唱|cover)\b/gi, '')
+    .replace(/[\s\-_/.,，。:：'"“”‘’|]+/g, '')
+    .trim();
+}
+
+async function fetchNeteaseLyricPayload(id) {
+  let body = {};
+  let source = 'lyric';
+  if (typeof lyric_new === 'function') {
+    try {
+      const nr = await lyric_new({ id, cookie: userCookie, timestamp: Date.now() });
+      body = nr.body || {};
+      source = 'lyric_new';
+    } catch (errNew) {
+      console.warn('[LyricNew]', errNew.message);
+    }
+  }
+  if (!((body.lrc && body.lrc.lyric) || (body.yrc && body.yrc.lyric))) {
+    const r = await lyric({ id, cookie: userCookie, timestamp: Date.now() });
+    body = r.body || body || {};
+    source = 'lyric';
+  }
+  return {
+    lyric: (body.lrc && body.lrc.lyric) || '',
+    tlyric: (body.tlyric && body.tlyric.lyric) || '',
+    yrc: (body.yrc && body.yrc.lyric) || '',
+    source,
+  };
+}
+
+// MINERADIO_SPOTIFY_LYRICS_PLUS_LITE_PATCH v4
+function plainLyricsToPseudoLrc(text) {
+  const lines = String(text || '')
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(Boolean);
+  if (!lines.length) return '';
+  return lines.map((line, index) => {
+    const seconds = index * 4;
+    const mm = String(Math.floor(seconds / 60)).padStart(2, '0');
+    const ss = String(seconds % 60).padStart(2, '0');
+    return `[${mm}:${ss}.00]${line}`;
+  }).join('\n');
+}
+
+function lyricPayloadHasText(payload) {
+  return !!(payload && (String(payload.yrc || '').trim() || String(payload.lyric || '').trim() || String(payload.tlyric || '').trim()));
+}
+
+function cleanSpotifyLyricTitle(title) {
+  return String(title || '')
+    .replace(/\s*[-–—]\s*(?:remaster(?:ed)?|live|acoustic|sped up|slowed|radio edit|explicit|clean|original game soundtrack|ost|soundtrack).*$/i, '')
+    .replace(/\s*\((?:feat\.|ft\.|with|remaster(?:ed)?|live|acoustic|sped up|slowed|radio edit|explicit|clean|original game soundtrack|ost|soundtrack)[^)]+\)\s*$/i, '')
+    .replace(/\s*\[[^\]]*(?:feat\.|ft\.|with|remaster(?:ed)?|live|acoustic|sped up|slowed|radio edit|explicit|clean|original game soundtrack|ost|soundtrack)[^\]]*\]\s*$/i, '')
+    .replace(/\s*[-–—]\s*(?:from|theme from)\s+.*$/i, '')
+    .trim();
+}
+
+function dedupeLyricLookupStrings(values) {
+  const seen = new Set();
+  const out = [];
+  (values || []).forEach(value => {
+    const text = String(value || '').replace(/\s+/g, ' ').trim();
+    if (!text) return;
+    const key = text.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push(text);
+  });
+  return out;
+}
+
+function spotifyLyricTitleVariants(title, album) {
+  const raw = String(title || '').replace(/\s+/g, ' ').trim();
+  const clean = cleanSpotifyLyricTitle(raw);
+  const noParens = clean.replace(/\s*[（(][^）)]*[）)]\s*/g, ' ').replace(/\s+/g, ' ').trim();
+  const noBrackets = clean.replace(/\s*[\[【][^\]】]*[\]】]\s*/g, ' ').replace(/\s+/g, ' ').trim();
+  const beforeDash = clean.split(/\s+[-–—]\s+/)[0];
+  const albumClean = cleanSpotifyLyricTitle(album || '');
+  return dedupeLyricLookupStrings([clean, noParens, noBrackets, beforeDash, raw, albumClean && raw.toLowerCase().includes(albumClean.toLowerCase()) ? clean : '']);
+}
+
+function spotifyLyricArtistVariants(artist) {
+  const raw = String(artist || '').replace(/\s+/g, ' ').trim();
+  const parts = raw
+    .split(/\s*(?:\/|,|&|;|、|，| feat\.? | ft\.? | with | x | × )\s*/i)
+    .map(s => s.replace(/\s+/g, ' ').trim())
+    .filter(Boolean);
+  const noise = /^(?:wuthering waves|vision sound|spotify|various artists|original game soundtrack|ost)$/i;
+  return dedupeLyricLookupStrings(parts.concat(raw).filter(x => !noise.test(x))).concat(parts.filter(x => noise.test(x))).filter(Boolean);
+}
+
+function splitPrimaryArtist(artist) {
+  const variants = spotifyLyricArtistVariants(artist);
+  return variants[0] || String(artist || '').trim();
+}
+
+function buildLrclibUrl(endpoint, params) {
+  const u = new URL(LRCLIB_API_URL + endpoint);
+  Object.entries(params || {}).forEach(([key, value]) => {
+    if (value === null || value === undefined || value === '') return;
+    u.searchParams.set(key, String(value));
+  });
+  return u.toString();
+}
+
+function scoreLyricMatch(record, targetTitle, targetArtist, targetAlbum, targetDurationSec) {
+  const title = normalizeLyricLookupText(record && (record.trackName || record.name));
+  const artist = normalizeLyricLookupText(record && record.artistName);
+  const album = normalizeLyricLookupText(record && record.albumName);
+  let score = 0;
+  if (title && title === targetTitle) score += 80;
+  else if (title && targetTitle && (title.includes(targetTitle) || targetTitle.includes(title))) score += 45;
+  if (targetArtist && artist && (artist.includes(targetArtist) || targetArtist.includes(artist))) score += 32;
+  if (targetAlbum && album && (album.includes(targetAlbum) || targetAlbum.includes(album))) score += 10;
+  const duration = Number(record && record.duration) || 0;
+  if (duration && targetDurationSec) {
+    const diff = Math.abs(duration - targetDurationSec);
+    if (diff <= 2) score += 12;
+    else if (diff <= 6) score += 6;
+    else if (diff > 18) score -= 14;
+  }
+  if (record && record.syncedLyrics) score += 14;
+  else if (record && record.plainLyrics) score += 4;
+  if (record && record.instrumental) score -= 25;
+  return score;
+}
+
+function mapLrclibLyricPayload(record, method, score) {
+  record = record || {};
+  if (record.instrumental) {
+    return { provider: 'spotify', source: 'lrclib-' + method, lyric: '', yrc: '', tlyric: '', instrumental: true, matched: null };
+  }
+  const synced = String(record.syncedLyrics || '').trim();
+  const plain = String(record.plainLyrics || '').trim();
+  const lyric = synced || plainLyricsToPseudoLrc(plain);
+  if (!lyric) return null;
+  return {
+    provider: 'spotify',
+    source: 'lrclib-' + method + (synced ? '-synced' : '-plain'),
+    lyric,
+    yrc: '',
+    tlyric: '',
+    matched: {
+      provider: 'lrclib',
+      id: record.id || '',
+      name: record.trackName || record.name || '',
+      artist: record.artistName || '',
+      album: record.albumName || '',
+      duration: record.duration || 0,
+      synced: !!synced,
+      score: Math.round(score || 0),
+    },
+  };
+}
+
+async function fetchLrclibLyrics(title, artist, opts) {
+  opts = opts || {};
+  const album = String(opts.album || '').trim();
+  const durationSec = Math.round((Number(opts.durationMs) || 0) / 1000) || Math.round(Number(opts.duration) || 0) || 0;
+  const titleVariants = spotifyLyricTitleVariants(title, album);
+  const artistVariants = spotifyLyricArtistVariants(artist);
+  if (!titleVariants.length) return null;
+
+  const headers = {
+    'User-Agent': `Mineradio/${APP_VERSION} (https://github.com/Lynx-1ST/Mineradio-EN)`,
+    Accept: 'application/json',
+  };
+
+  const targetTitle = normalizeLyricLookupText(titleVariants[0]);
+  const targetArtists = dedupeLyricLookupStrings(artistVariants).map(normalizeLyricLookupText).filter(Boolean);
+  const targetArtist = targetArtists[0] || '';
+  const targetAlbum = normalizeLyricLookupText(album);
+  const attempts = [];
+
+  async function tryDirect(trackName, artistName, includeAlbum, includeDuration) {
+    const params = { track_name: trackName };
+    if (artistName) params.artist_name = artistName;
+    if (includeAlbum && album) params.album_name = album;
+    if (includeDuration && durationSec) params.duration = durationSec;
+    try {
+      const direct = await requestJson(buildLrclibUrl('/get', params), { headers });
+      const normArtist = normalizeLyricLookupText(artistName || '');
+      const score = Math.max(
+        scoreLyricMatch(direct, normalizeLyricLookupText(trackName), normArtist || targetArtist, includeAlbum ? targetAlbum : '', durationSec),
+        scoreLyricMatch(direct, targetTitle, targetArtist, targetAlbum, durationSec)
+      );
+      const payload = mapLrclibLyricPayload(direct, 'get', score);
+      attempts.push({ method: 'get', trackName, artistName, score, ok: !!payload });
+      if (payload && score >= 52) return payload;
+    } catch (err) {
+      attempts.push({ method: 'get', trackName, artistName, error: err && err.statusCode || err && err.message || String(err) });
+      if (err && err.statusCode && err.statusCode !== 404) console.warn('[LRCLIB] direct lookup failed:', err.message);
+    }
+    return null;
+  }
+
+  const directArtists = artistVariants.length ? artistVariants.slice(0, 2) : [''];
+  for (const trackName of titleVariants.slice(0, 3)) {
+    for (const artistName of directArtists) {
+      let payload = await tryDirect(trackName, artistName, true, true);
+      if (payload) return { ...payload, debugAttempts: attempts.slice(-8) };
+      payload = await tryDirect(trackName, artistName, false, true);
+      if (payload) return { ...payload, debugAttempts: attempts.slice(-8) };
+    }
+  }
+
+  let rows = [];
+  const searchQueries = [];
+  titleVariants.slice(0, 3).forEach(trackName => {
+    artistVariants.slice(0, 3).forEach(artistName => {
+      searchQueries.push({ track_name: trackName, artist_name: artistName });
+      searchQueries.push({ q: [trackName, artistName].filter(Boolean).join(' ') });
+    });
+    searchQueries.push({ q: trackName });
+  });
+
+  for (const params of searchQueries) {
+    try {
+      const found = await requestJson(buildLrclibUrl('/search', params), { headers });
+      if (Array.isArray(found) && found.length) {
+        rows = rows.concat(found);
+        attempts.push({ method: 'search', params, count: found.length });
+        if (rows.length >= 12) break;
+      }
+    } catch (err) {
+      attempts.push({ method: 'search', params, error: err && err.statusCode || err && err.message || String(err) });
+      if (err && err.statusCode && err.statusCode !== 404) console.warn('[LRCLIB] search failed:', err.message);
+    }
+  }
+  if (!Array.isArray(rows) || !rows.length) return null;
+
+  const unique = [];
+  const seen = new Set();
+  rows.forEach(row => {
+    const key = String(row && (row.id || (row.trackName + '|' + row.artistName + '|' + row.albumName)) || '').toLowerCase();
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    unique.push(row);
+  });
+
+  let best = null;
+  let bestScore = -1;
+  unique.slice(0, 18).forEach(row => {
+    let score = scoreLyricMatch(row, targetTitle, targetArtist, targetAlbum, durationSec);
+    for (const t of titleVariants) {
+      for (const a of (targetArtists.length ? targetArtists : [''])) {
+        score = Math.max(score, scoreLyricMatch(row, normalizeLyricLookupText(t), a, targetAlbum, durationSec));
+      }
+    }
+    if (score > bestScore) {
+      best = row;
+      bestScore = score;
+    }
+  });
+  if (!best || bestScore < 42) return null;
+  const payload = mapLrclibLyricPayload(best, 'search', bestScore);
+  return payload ? { ...payload, debugAttempts: attempts.slice(-12) } : null;
+}
+
+function scoreMetadataSongCandidate(song, targetTitle, targetArtist) {
+  const songTitle = normalizeLyricLookupText(song && song.name);
+  const songArtist = normalizeLyricLookupText(song && song.artist);
+  let score = 0;
+  if (songTitle && songTitle === targetTitle) score += 80;
+  else if (songTitle && (songTitle.includes(targetTitle) || targetTitle.includes(songTitle))) score += 45;
+  if (targetArtist && songArtist && (songArtist.includes(targetArtist) || targetArtist.includes(songArtist))) score += 30;
+  if (song && song.id) score += 5;
+  return score;
+}
+
+async function fetchNeteaseLyricsByMetadata(title, artist) {
+  const cleanTitle = cleanSpotifyLyricTitle(title);
+  const cleanArtist = splitPrimaryArtist(artist);
+  const query = [cleanTitle, cleanArtist].filter(Boolean).join(' ');
+  const candidates = await handleSearch(query, 8);
+  const targetTitle = normalizeLyricLookupText(cleanTitle);
+  const targetArtist = normalizeLyricLookupText(cleanArtist);
+  let best = null;
+  let bestScore = -1;
+  (candidates || []).forEach(song => {
+    const score = scoreMetadataSongCandidate(song, targetTitle, targetArtist);
+    if (score > bestScore) {
+      best = song;
+      bestScore = score;
+    }
+  });
+  if (!best || bestScore < 45) return null;
+  const payload = await fetchNeteaseLyricPayload(best.id);
+  if (!lyricPayloadHasText(payload)) return null;
+  return {
+    ...payload,
+    provider: 'spotify',
+    source: 'netease-metadata-' + payload.source,
+    matched: {
+      provider: 'netease',
+      id: best.id,
+      name: best.name,
+      artist: best.artist,
+      score: bestScore,
+    },
+  };
+}
+
+async function fetchQQLyricsByMetadata(title, artist) {
+  const cleanTitle = cleanSpotifyLyricTitle(title);
+  const cleanArtist = splitPrimaryArtist(artist);
+  const query = [cleanTitle, cleanArtist].filter(Boolean).join(' ');
+  if (!query) return null;
+  const candidates = await handleQQSearch(query, 8);
+  const targetTitle = normalizeLyricLookupText(cleanTitle);
+  const targetArtist = normalizeLyricLookupText(cleanArtist);
+  let best = null;
+  let bestScore = -1;
+  (candidates || []).forEach(song => {
+    const score = scoreMetadataSongCandidate(song, targetTitle, targetArtist);
+    if (score > bestScore) {
+      best = song;
+      bestScore = score;
+    }
+  });
+  if (!best || bestScore < 45) return null;
+  const payload = await handleQQLyric(best.mid || best.songmid || best.id, best.qqId || best.id);
+  if (!lyricPayloadHasText(payload)) return null;
+  return {
+    ...payload,
+    provider: 'spotify',
+    source: 'qq-metadata-' + (payload.source || 'lyric'),
+    matched: {
+      provider: 'qq',
+      id: best.id,
+      mid: best.mid || best.songmid || '',
+      name: best.name,
+      artist: best.artist,
+      score: bestScore,
+    },
+  };
+}
+
+function spotifyLyricTimeout(ms, label) {
+  return new Promise((_, reject) => {
+    setTimeout(() => {
+      const err = new Error(label + ' timeout');
+      err.code = 'SPOTIFY_LYRIC_TIMEOUT';
+      reject(err);
+    }, ms);
+  });
+}
+
+async function withSpotifyLyricTimeout(label, ms, loader) {
+  const started = Date.now();
+  const payload = await Promise.race([loader(), spotifyLyricTimeout(ms, label)]);
+  if (payload && typeof payload === 'object') payload.lookupMs = Date.now() - started;
+  return payload;
+}
+
+async function handleSpotifyLyricLookup(title, artist, opts) {
+  const cleanTitle = String(title || '').trim();
+  const cleanArtist = String(artist || '').trim();
+  if (!cleanTitle) return { provider: 'spotify', source: 'lyrics-plus-lite-v3', lyric: '', yrc: '', tlyric: '', matched: null, attempts: [] };
+
+  opts = opts || {};
+  const attempts = [];
+  const startedAll = Date.now();
+  const providers = [
+    ['lrclib', 4500, () => fetchLrclibLyrics(cleanTitle, cleanArtist, opts)],
+    ['netease', 5500, () => fetchNeteaseLyricsByMetadata(cleanTitle, cleanArtist)],
+    ['qq', 5500, () => fetchQQLyricsByMetadata(cleanTitle, cleanArtist)],
+  ];
+
+  console.log('[SpotifyLyric] backend lookup start', JSON.stringify({ title: cleanTitle, artist: cleanArtist, album: opts.album || '', durationMs: opts.durationMs || opts.duration || '' }));
+
+  for (const [name, timeoutMs, loader] of providers) {
+    const providerStarted = Date.now();
+    try {
+      const payload = await withSpotifyLyricTimeout(name, timeoutMs, loader);
+      attempts.push({ provider: name, ok: !!lyricPayloadHasText(payload), source: payload && payload.source || '', ms: Date.now() - providerStarted });
+      if (lyricPayloadHasText(payload)) {
+        console.log('[SpotifyLyric] backend lookup hit', JSON.stringify({ provider: name, source: payload.source || '', ms: Date.now() - startedAll }));
+        return { ...payload, provider: 'spotify', attempts, lookupMs: Date.now() - startedAll };
+      }
+    } catch (err) {
+      attempts.push({ provider: name, ok: false, error: err && err.message || String(err), ms: Date.now() - providerStarted });
+      console.warn('[SpotifyLyric]', name, 'lookup failed:', err && err.message || err);
+    }
+  }
+
+  console.log('[SpotifyLyric] backend lookup miss', JSON.stringify({ title: cleanTitle, artist: cleanArtist, ms: Date.now() - startedAll, attempts }));
+  return { provider: 'spotify', source: 'lyrics-plus-lite-v3', lyric: '', yrc: '', tlyric: '', matched: null, attempts, lookupMs: Date.now() - startedAll };
+}
+
 async function handleQQLyric(mid, id) {
   const songMID = String(mid || '').trim();
   const songID = normalizeQQSongId(id);
@@ -3261,6 +4004,13 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (pn === '/api/language') {
+    const lang = url.searchParams.get('lang') || 'en';
+    loadServerLang(lang);
+    sendJSON(res, { ok: true, lang: serverLang });
+    return;
+  }
+
   if (pn === '/api/update/latest') {
     try {
       sendJSON(res, await fetchLatestUpdateInfo());
@@ -3396,7 +4146,7 @@ const server = http.createServer(async (req, res) => {
         ok: false,
         error: err.message,
         weather: null,
-        radio: { title: '天气电台', subtitle: '天气暂时没有回来，可以先听今日推荐。', seedQueries: [], songs: [] },
+        radio: { title: st('weather_fallback'), subtitle: st('weather_fallback_hint'), seedQueries: [], songs: [] },
       }, 500);
     }
     return;
@@ -3433,6 +4183,132 @@ const server = http.createServer(async (req, res) => {
       console.error('[QQSearch]', err);
       sendJSON(res, { provider: 'qq', error: err.message, songs: [] }, 500);
     }
+    return;
+  }
+
+  if (pn === '/api/spotify/search') {
+    try {
+      const kw = url.searchParams.get('keywords') || '';
+      const limit = Math.max(4, Math.min(30, parseInt(url.searchParams.get('limit') || '10', 10) || 10));
+      const songs = await handleSpotifySearch(kw, limit);
+      sendJSON(res, { provider: 'spotify', configured: true, songs });
+    } catch (err) {
+      const notConfigured = err && err.code === 'SPOTIFY_NOT_CONFIGURED';
+      if (!notConfigured) console.error('[SpotifySearch]', err);
+      sendJSON(res, {
+        provider: 'spotify',
+        configured: false,
+        error: notConfigured ? 'SPOTIFY_NOT_CONFIGURED' : err.message,
+        message: notConfigured
+          ? 'Set SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET to enable Spotify search.'
+          : 'Spotify search failed.',
+        songs: [],
+      }, notConfigured ? 200 : 500);
+    }
+    return;
+  }
+
+  if (pn === '/api/spotify/login') {
+    try {
+      sendJSON(res, { provider: 'spotify', configured: true, loginUrl: spotifyLoginUrl(), redirectUri: SPOTIFY_REDIRECT_URI });
+    } catch (err) {
+      const notConfigured = err && err.code === 'SPOTIFY_NOT_CONFIGURED';
+      sendJSON(res, {
+        provider: 'spotify',
+        configured: false,
+        loggedIn: false,
+        error: notConfigured ? 'SPOTIFY_NOT_CONFIGURED' : err.message,
+        message: notConfigured ? 'Set SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET in .env first.' : err.message,
+      }, notConfigured ? 200 : 500);
+    }
+    return;
+  }
+
+  if (pn === '/api/spotify/callback') {
+    try {
+      const code = url.searchParams.get('code') || '';
+      const state = url.searchParams.get('state') || '';
+      const error = url.searchParams.get('error') || '';
+      if (error) throw new Error(error);
+      if (!code) throw new Error('Missing Spotify authorization code');
+      const info = await handleSpotifyCallback(code, state);
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end('<!doctype html><meta charset="utf-8"><title>Spotify connected</title><body style="font-family:system-ui;background:#0b0f0d;color:#eafff2;display:grid;place-items:center;height:100vh;margin:0"><main><h1>Spotify connected</h1><p>You can close this window and return to Mineradio.</p><script>setTimeout(function(){window.close()},1200)</script></main></body>');
+      console.log('[SpotifyLogin]', info.nickname || info.userId || 'connected');
+    } catch (err) {
+      res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end('<!doctype html><meta charset="utf-8"><title>Spotify login failed</title><body style="font-family:system-ui;background:#180b0f;color:#fff;display:grid;place-items:center;height:100vh;margin:0"><main><h1>Spotify login failed</h1><p>' + String(err.message || err).replace(/[<>&"]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c])) + '</p></main></body>');
+    }
+    return;
+  }
+
+  if (pn === '/api/spotify/status') {
+    sendJSON(res, spotifySessionPublic());
+    return;
+  }
+
+  if (pn === '/api/spotify/token') {
+    try {
+      const token = await refreshSpotifyUserAccessToken();
+      if (!token) {
+        sendJSON(res, { provider: 'spotify', loggedIn: false, error: 'SPOTIFY_LOGIN_REQUIRED', message: 'Login with Spotify first.' }, 401);
+        return;
+      }
+      sendJSON(res, {
+        provider: 'spotify',
+        loggedIn: true,
+        accessToken: token,
+        expiresAt: spotifyUserSession && spotifyUserSession.expiresAt || 0,
+        scope: spotifyUserSession && spotifyUserSession.scope || '',
+        product: spotifyUserSession && spotifyUserSession.profile && spotifyUserSession.profile.product || '',
+      });
+    } catch (err) {
+      sendJSON(res, { provider: 'spotify', loggedIn: false, error: err.message, message: 'Spotify token refresh failed.' }, 401);
+    }
+    return;
+  }
+
+  if (pn === '/api/spotify/user/playlists') {
+    try {
+      sendJSON(res, await handleSpotifyUserPlaylists());
+    } catch (err) {
+      const body = String(err && err.body || '');
+      const insufficientScope = (err && err.statusCode === 403 && /Insufficient client scope/i.test(body));
+      if (!insufficientScope) console.error('[SpotifyUserPlaylists]', err);
+      sendJSON(res, {
+        provider: 'spotify',
+        loggedIn: false,
+        error: insufficientScope ? 'SPOTIFY_SCOPE_UPGRADE_REQUIRED' : err.message,
+        message: insufficientScope ? 'Please log out and log in with Spotify again to grant playlist access.' : 'Spotify playlists failed to load.',
+        playlists: [],
+      }, insufficientScope ? 200 : (err && err.code === 'SPOTIFY_LOGIN_REQUIRED' ? 401 : 500));
+    }
+    return;
+  }
+
+  if (pn === '/api/spotify/playlist/tracks') {
+    try {
+      const id = url.searchParams.get('id') || '';
+      sendJSON(res, await handleSpotifyPlaylistTracks(id));
+    } catch (err) {
+      const body = String(err && err.body || '');
+      const insufficientScope = (err && err.statusCode === 403 && /Insufficient client scope/i.test(body));
+      if (!insufficientScope) console.error('[SpotifyPlaylistTracks]', err);
+      sendJSON(res, {
+        provider: 'spotify',
+        error: insufficientScope ? 'SPOTIFY_SCOPE_UPGRADE_REQUIRED' : err.message,
+        message: insufficientScope ? 'Please log out and log in with Spotify again to grant playlist access.' : 'Spotify playlist failed to load.',
+        tracks: [],
+      }, insufficientScope ? 200 : (err && err.code === 'SPOTIFY_LOGIN_REQUIRED' ? 401 : 500));
+    }
+    return;
+  }
+
+  if (pn === '/api/spotify/logout') {
+    saveSpotifyUserSession(null);
+    spotifyTokenCache.token = '';
+    spotifyTokenCache.expiresAt = 0;
+    sendJSON(res, { provider: 'spotify', loggedIn: false, ok: true });
     return;
   }
 
@@ -3988,6 +4864,20 @@ const server = http.createServer(async (req, res) => {
   }
 
   // ---------- 歌词 ----------
+  if (pn === '/api/spotify/lyric') {
+    try {
+      const title = url.searchParams.get('title') || url.searchParams.get('name') || '';
+      const artist = url.searchParams.get('artist') || '';
+      const album = url.searchParams.get('album') || '';
+      const duration = url.searchParams.get('duration') || url.searchParams.get('durationMs') || '';
+      sendJSON(res, await handleSpotifyLyricLookup(title, artist, { album, durationMs: duration }));
+    } catch (err) {
+      console.error('[SpotifyLyric]', err);
+      sendJSON(res, { provider: 'spotify', error: err.message, lyric: '', yrc: '', tlyric: '' }, 500);
+    }
+    return;
+  }
+
   if (pn === '/api/lyric') {
     try {
       const id = url.searchParams.get('id');
