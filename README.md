@@ -39,20 +39,24 @@ Security note: `v1.0.10` and older installers are no longer recommended for inst
 
 ## Features
 
-- Open-Meteo weather radio that builds a more fitting queue from your city, location, and weather mood.
-- Home view with weather radio, daily recommendations, private radio, continue listening, listening profile, and playlist entry points.
-- Galaxy wallpaper background that keeps the idle state clean before playback begins.
-- Emily/default playback visuals after playback starts, with synced lyric and particle stages.
-- Beat-driven cinematic camera system.
-- Dedicated visual mode for long podcasts and DJ tracks.
-- Lyric stage, custom lyrics, lyric position controls, and visual controls.
-- Custom album-cover upload and cropping.
-- Right-click 3D playlist shelf for browsing playlist queues.
-- Spotify search and local Spotify OAuth login support.
-- English-first desktop interface with local playback, lyrics, playlists, and visual controls.
-- Spotify search integration with cover metadata and legal preview playback when Spotify provides a preview URL.
-- GitHub Releases update checking and in-app download entry.
-- Built-in default visual archive for a consistent first-launch experience.
+* Open-Meteo weather radio that builds a fitting queue from your city, location, and weather mood.
+* Home view with weather radio, daily recommendations, private radio, continue listening, listening profile, and playlist entry points.
+* Galaxy wallpaper background that keeps the idle state clean before playback begins.
+* Emily/default playback visuals after playback starts, with synced lyric and particle stages.
+* Beat-driven cinematic camera system with reactive album-cover motion.
+* Dedicated visual mode for long podcasts and DJ tracks.
+* Lyric stage with synced lyrics, custom lyrics, lyric position controls, glow effects, particle effects, and visual controls.
+* Spotify Lyrics Plus Lite support with metadata-based lyric lookup, LRCLIB fallback, NetEase fallback, and QQ fallback.
+* Spotify search integration with cover metadata, local OAuth login, playlist support, and local playback control.
+* Spotify Desktop fallback support for playback when Electron/Web Playback DRM is rejected.
+* Spotify queue autoplay support when the current track ends.
+* Reactive background visualizer with aura glow, pulse rings, ambient particles, and animated spectrum-style background effects.
+* Custom album-cover upload and cropping.
+* Right-click 3D playlist shelf for browsing playlist queues.
+* English-first desktop interface with local playback, lyrics, playlists, and visual controls.
+* GitHub Releases update checking and in-app download entry.
+* Built-in default visual archive for a consistent first-launch experience.
+
 
 ## Usage
 
